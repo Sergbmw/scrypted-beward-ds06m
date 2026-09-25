@@ -2,6 +2,8 @@
 
 [Русский](README.md) · [English](README.en.md)
 
+![BEWARD DS06M door station](assets/beward-ds06m.jpeg)
+
 This plugin integrates the BEWARD DS06M door station with [Scrypted](https://www.scrypted.app/). Official documentation is available at [docs.scrypted.app](https://docs.scrypted.app/).
 
 It exposes the DS06M as a `Doorbell`. Video and incoming audio can come directly from the DS06M RTSP stream or from another Scrypted camera, while talkback audio is sent to the panel over SIP. The gate lock is included in the same HomeKit accessory.

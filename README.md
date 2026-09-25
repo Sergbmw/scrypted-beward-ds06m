@@ -2,6 +2,8 @@
 
 [Русский](README.md) · [English](README.en.md)
 
+![Домофон BEWARD DS06M](assets/beward-ds06m.jpeg)
+
 Плагин предназначен для платформы [Scrypted](https://www.scrypted.app/). Официальная документация: [docs.scrypted.app](https://docs.scrypted.app/).
 
 Плагин добавляет домофон BEWARD DS06M в Scrypted как устройство типа `Doorbell`. Видео и входящий звук можно получать напрямую из RTSP-потока DS06M или из отдельной камеры Scrypted, а обратный звук передаётся в панель по SIP. В HomeKit домофон отображается вместе с замком калитки.
