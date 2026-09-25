@@ -1,5 +1,5 @@
 import { closeQuiet, createBindZero, ffmpegLogInitialOutput, listenZero, safePrintFFmpegArguments } from './compat';
-import type { BinarySensor, Camera, DeviceProvider, DeviceCreator, DeviceCreatorSettings, EventListenerRegister, FFmpegInput, Intercom, Lock, MediaObject, MixinProvider, MotionSensor, PictureOptions, ResponseMediaStreamOptions, ScryptedDevice, ScryptedDeviceType as ScryptedDeviceTypeValue, ScryptedInterface as ScryptedInterfaceValue, Setting, Settings, SettingValue, VideoCamera, WritableDeviceState } from '@scrypted/sdk';
+import type { BinarySensor, Camera, DeviceProvider, DeviceCreator, DeviceCreatorSettings, EventListenerRegister, FFmpegInput, Intercom, Lock, MediaObject, MediaStreamUrl, MixinProvider, MotionSensor, PictureOptions, ResponseMediaStreamOptions, ScryptedDevice, ScryptedDeviceType as ScryptedDeviceTypeValue, ScryptedInterface as ScryptedInterfaceValue, Setting, Settings, SettingValue, VideoCamera, WritableDeviceState } from '@scrypted/sdk';
 import child_process, { ChildProcess } from 'child_process';
 import dgram from 'dgram';
 import http from 'http';
@@ -16,7 +16,7 @@ import { deviceManager, mediaManager, sdk, ScryptedDeviceBase, ScryptedDeviceTyp
 const LEGACY_GATE_LOCK_NATIVE_ID = 'ds06m-gate-lock';
 const DOORBELL_NAME = 'Домофон';
 const DOORBELL_ROOM = 'Улица';
-const PLUGIN_VERSION = '0.4.5';
+const PLUGIN_VERSION = '0.4.6';
 const DOORBELL_INTERFACES = [
     ScryptedInterface.Camera,
     ScryptedInterface.VideoCamera,
@@ -76,15 +76,18 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
     async takePicture(option?: PictureOptions): Promise<MediaObject> {
         const sourceCameraId = this.storage.getItem('sourceCameraId');
         const source = sourceCameraId && sdk.systemManager.getDeviceById(sourceCameraId) as unknown as Camera;
-        if (!source?.takePicture)
-            throw new Error('The configured source camera does not provide snapshots.');
-        return source.takePicture(option);
+        if (source?.takePicture)
+            return source.takePicture(option);
+
+        const stream = await this.getDirectVideoStream();
+        const jpeg = await mediaManager.convertMediaObjectToBuffer(stream, 'image/jpeg');
+        return this.createMediaObject(jpeg, 'image/jpeg');
     }
 
     async getPictureOptions(): Promise<PictureOptions[]> {
         const sourceCameraId = this.storage.getItem('sourceCameraId');
         const source = sourceCameraId && sdk.systemManager.getDeviceById(sourceCameraId) as unknown as Camera;
-        return source?.getPictureOptions?.();
+        return source?.getPictureOptions?.() || [{}];
     }
 
     storageSettings = new StorageSettings(this, {
@@ -129,7 +132,7 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
                 key: 'sourceCameraId',
                 title: 'Source Camera ID',
                 value: this.storage.getItem('sourceCameraId'),
-                description: 'Scrypted ID of the working ONVIF/RTSP camera. Video and incoming audio are read from this device; SIP is used only for talkback.',
+                description: 'Optional Scrypted camera ID. Leave empty to use the RTSP Stream URL directly; SIP is used only for talkback.',
                 placeholder: 'device-id',
             },
             {
@@ -584,7 +587,10 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
     }
 
     getRawVideoStreamOptions(): ResponseMediaStreamOptions[] {
-        const ffmpegInputs = this.storageSettings.values.ffmpegInputs as string[];
+        const configuredInputs = this.storageSettings.values.ffmpegInputs;
+        const ffmpegInputs = Array.isArray(configuredInputs)
+            ? configuredInputs
+            : configuredInputs ? [configuredInputs.toString()] : [];
 
         // filter out empty strings.
         const ret = ffmpegInputs
@@ -600,10 +606,17 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
     async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
         await this.ensureIncomingSip();
         const sourceCameraId = this.storage.getItem('sourceCameraId');
-        if (!sourceCameraId)
-            throw new Error('Source Camera ID is not configured.');
-        const source = sdk.systemManager.getDeviceById(sourceCameraId) as unknown as VideoCamera;
-        return source.getVideoStreamOptions();
+        if (sourceCameraId) {
+            const source = sdk.systemManager.getDeviceById(sourceCameraId) as unknown as VideoCamera;
+            if (!source?.getVideoStreamOptions)
+                throw new Error(`Source Camera ID ${sourceCameraId} is unavailable.`);
+            return source.getVideoStreamOptions();
+        }
+
+        const direct = this.getRawVideoStreamOptions();
+        if (!direct?.length)
+            throw new Error('Configure an RTSP Stream URL or a Source Camera ID.');
+        return direct;
     }
 
     getDefaultStream(vsos: ResponseMediaStreamOptions[]) {
@@ -612,24 +625,23 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
 
     async getVideoStream(options?: ResponseMediaStreamOptions): Promise<MediaObject> {
         const sourceCameraId = this.storage.getItem('sourceCameraId');
-        if (!sourceCameraId)
-            throw new Error('Source Camera ID is not configured.');
-        const source = sdk.systemManager.getDeviceById(sourceCameraId) as unknown as VideoCamera;
-        return source.getVideoStream(options);
+        if (sourceCameraId) {
+            const source = sdk.systemManager.getDeviceById(sourceCameraId) as unknown as VideoCamera;
+            if (!source?.getVideoStream)
+                throw new Error(`Source Camera ID ${sourceCameraId} is unavailable.`);
+            return source.getVideoStream(options);
+        }
+
+        return this.getDirectVideoStream(options);
     }
 
 
-    createFFmpegMediaStreamOptions(ffmpegInput: string, index: number) {
-        try {
-        }
-        catch (e) {
-        }
-
+    createFFmpegMediaStreamOptions(ffmpegInput: string, index: number): ResponseMediaStreamOptions {
         return {
             id: `channel${index}`,
             name: `Stream ${index + 1}`,
-            url: undefined,
-            container: '', // must be empty to support prebuffering
+            container: 'rtsp',
+            source: 'local',
             video: {
                 codec: 'h264',
                 h264Info: {
@@ -643,11 +655,51 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
                     reserved31: false,
                 }
             },
-            audio: { /*this.isAudioDisabled() ? null : {}, */
-                // this is a hint to let homekit, et al, know that it's OPUS audio and does not need transcoding.
+            audio: {
                 codec: 'pcm_mulaw',
             },
         };
+    }
+
+    private addRtspCredentials(rtspUrl: string): string {
+        const username = this.storage.getItem('username');
+        if (!username)
+            return rtspUrl;
+
+        const parsed = new URL(rtspUrl);
+        if (!parsed.username) {
+            parsed.username = username;
+            parsed.password = this.storage.getItem('password') || '';
+        }
+        return parsed.toString();
+    }
+
+    private async getDirectVideoStream(options?: ResponseMediaStreamOptions): Promise<MediaObject> {
+        const streams = this.getRawVideoStreamOptions();
+        const selected = streams?.find(stream => stream.id === options?.id) || streams?.[0];
+        if (!selected)
+            throw new Error('RTSP Stream URL is not configured.');
+
+        const configuredInputs = this.storageSettings.values.ffmpegInputs;
+        const ffmpegInputs = Array.isArray(configuredInputs)
+            ? configuredInputs
+            : configuredInputs ? [configuredInputs.toString()] : [];
+        const index = Number.parseInt(selected.id.replace('channel', ''), 10) || 0;
+        const rtspUrl = ffmpegInputs[index];
+        if (!rtspUrl)
+            throw new Error(`RTSP stream ${selected.id} is unavailable.`);
+
+        const stream: MediaStreamUrl = {
+            url: this.addRtspCredentials(rtspUrl),
+            container: 'rtsp',
+            mediaStreamOptions: {
+                ...selected,
+                ...options,
+                id: selected.id,
+                container: 'rtsp',
+            },
+        };
+        return this.createMediaObject(stream, ScryptedMimeTypes.MediaStreamUrl);
     }
 
     async startSilenceGenerator() {

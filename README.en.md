@@ -4,7 +4,7 @@
 
 This plugin integrates the BEWARD DS06M door station with [Scrypted](https://www.scrypted.app/). Official documentation is available at [docs.scrypted.app](https://docs.scrypted.app/).
 
-It exposes the DS06M as a `Doorbell`. Video and incoming audio come from a working RTSP/ONVIF camera, while talkback audio is sent to the panel over SIP. The gate lock is included in the same HomeKit accessory.
+It exposes the DS06M as a `Doorbell`. Video and incoming audio can come directly from the DS06M RTSP stream or from another Scrypted camera, while talkback audio is sent to the panel over SIP. The gate lock is included in the same HomeKit accessory.
 
 ## Features
 
@@ -15,7 +15,7 @@ It exposes the DS06M as a `Doorbell`. Video and incoming audio come from a worki
 - delayed SIP answer until speech is detected, so merely opening the camera does not stop the doorbell from ringing;
 - HTTP gate relay control;
 - automatic HomeKit lock state reset without sending a second HTTP request;
-- snapshots from the selected source camera;
+- snapshots from the direct RTSP stream or from the selected source camera;
 - default manufacturer `BEWARD`, model `DS06M`, name `Домофон`, and room `Улица`.
 
 ## Requirements
@@ -41,14 +41,16 @@ The Scrypted CLI will request the server address and credentials. Never store a 
 
 | Setting | Example | Purpose |
 | --- | --- | --- |
-| `Source Camera ID` | Scrypted camera ID | Source of video, incoming audio, snapshots, and motion events |
-| `RTSP Stream URL` | `rtsp://<DOORBELL_HOST>:554/av0_0` | Direct DS06M stream when a separate source camera is not used |
+| `Source Camera ID` | Scrypted camera ID | Optional external source for video, audio, snapshots, and motion events; leave empty for direct RTSP |
+| `RTSP Stream URL` | `rtsp://<DOORBELL_HOST>:554/av0_0` | Direct DS06M stream used when `Source Camera ID` is empty |
 | `SIP From: URI` | `scrypted@<SCRYPTED_HOST>:5060` | Local SIP listener address |
 | `SIP To: URI` | `doorbell@<DOORBELL_HOST>:5060` | Door station SIP address |
 | `Open Relay URL` | `http://<USER>:<PASSWORD>@<DOORBELL_HOST>/cgi-bin/alarmout_cgi?channel=0&Output=0&Status=1` | Gate relay command |
 | `Auto Lock Delay` | `5` | Delay before returning the HomeKit lock state to locked |
 
 The relay URL is stored in Scrypted device storage. Do not include a real URL or credentials in source files, issues, or build logs.
+
+For a single `Doorbell` device, configure `RTSP Stream URL` and leave `Source Camera ID` empty. Keep a separate ONVIF/RTSP camera only for features unavailable from the direct stream, such as continuous ONVIF motion detection.
 
 ## DS06M SIP configuration
 
