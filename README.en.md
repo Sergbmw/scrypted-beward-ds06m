@@ -37,14 +37,6 @@ npm run scrypted-deploy -- <SCRYPTED_HOST>
 
 The Scrypted CLI will request the server address and credentials. Never store a password or token in the repository.
 
-## Setup screenshots
-
-These are sanitized interface examples. Server addresses, device identifiers, RTSP/SIP addresses, and credentials are hidden.
-
-![BEWARD DS06M device in Scrypted](docs/screenshots/device-overview.png)
-
-![SIP and relay settings](docs/screenshots/device-settings.png)
-
 ## Scrypted settings
 
 | Setting | Example | Purpose |
@@ -80,7 +72,15 @@ HomeKit may start sending talkback audio as soon as live view opens. The plugin 
 
 The doorbell exposes the `MotionSensor` interface required by HomeKit Secure Video. Motion from the selected source camera is forwarded to HomeKit. A DS06M button press also creates a 15-second motion event so HomeKit can record the call without a separate detector.
 
-After installation or an update, reload the HomeKit plugin in Scrypted. In Apple Home, open the doorbell settings, select Recording Options, and choose Stream & Allow Recording. HKSV requires an Apple TV or HomePod home hub and an eligible iCloud+ plan.
+Use a standalone HomeKit accessory for an HKSV camera:
+
+1. Open the `Домофон` device in Scrypted.
+2. Enable `Standalone Accessory Mode` in the `HomeKit` section.
+3. Reload the HomeKit plugin in Scrypted.
+4. Scan the QR code from the `HomeKit` section with an iPhone or iPad and add the doorbell to Apple Home.
+5. Open the doorbell settings, select Recording Options, and choose Stream & Allow Recording.
+
+A camera inside the shared HomeKit Bridge may fail when Apple Home saves the recording mode. Switching to `Standalone Accessory Mode` removes the doorbell from the old bridge, so it must be paired with Apple Home once more. HKSV requires an Apple TV or HomePod home hub and an eligible iCloud+ plan.
 
 ## Scrypted and plugin updates
 
@@ -88,7 +88,7 @@ After installation or an update, reload the HomeKit plugin in Scrypted. In Apple
 - **Official plugin updates.** HomeKit, ONVIF, Snapshot, and Prebuffer update independently. They do not replace the BEWARD DS06M code, but a new version may change video, audio, or HomeKit processing. Verify live video, incoming audio, and talkback after updating them.
 - **BEWARD DS06M updates.** This plugin is installed from a local build and is not updated automatically with Scrypted. Pull the new repository version, run `npm install`, `npm run build`, and deploy it again with `npm run scrypted-deploy -- <SCRYPTED_HOST>`.
 - **Settings retention.** Deploying a new build with the same package ID replaces the code and keeps the device settings. Changing the package ID creates a separate plugin in Scrypted and requires new configuration.
-- **Interface changes.** If a release adds `MotionSensor`, `Lock`, or another interface, reload BEWARD DS06M and HomeKit. Removing and pairing the Apple Home accessory again is usually unnecessary.
+- **Interface changes.** If a release adds `MotionSensor`, `Lock`, or another interface, reload BEWARD DS06M and HomeKit. Pairing is required again only when moving between the HomeKit Bridge and `Standalone Accessory Mode`, or after resetting pairing data.
 - **Post-update validation.** Place a real call and verify video, incoming audio, talkback, ringing duration, gate opening, and HKSV recording. A green plugin status alone does not prove that SIP/RTP works on the door station.
 
 Official backup and restore instructions: [Backup and Restore](https://docs.scrypted.app/maintenance/migration.html).

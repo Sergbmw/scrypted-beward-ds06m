@@ -1,6 +1,6 @@
 {
    "name": "scrypted-beward-ds06m",
-   "version": "0.4.4",
+   "version": "0.4.5",
    "description": "Плагин Scrypted для домофона BEWARD DS06M: HomeKit, SIP-аудио и управление калиткой.",
    "license": "MIT",
    "repository": {

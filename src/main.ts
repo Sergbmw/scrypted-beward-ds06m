@@ -5,146 +5,27 @@ import dgram from 'dgram';
 import http from 'http';
 import https from 'https';
 import net from 'net';
+import { decodeMuLawSample } from './audio-utils';
+import { Ds06mGateRelay } from './gate-relay';
 import { SipCallSession } from './sip-call-session';
 import { SipManager, SipOptions } from './sip-manager';
 import { RtpDescription, isStunMessage, getPayloadType, getSequenceNumber, isRtpMessagePayloadType } from './rtp-utils';
 import { randomBytes } from "crypto";
+import { deviceManager, mediaManager, sdk, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, StorageSettings } from './scrypted-sdk';
 
-// Load the SDK through CommonJS. Scrypted 0.147 runs plugins as CommonJS and
-// the published SDK's ESM interop path can otherwise initialize before the
-// server has exposed its static runtime object.
-const { StorageSettings } = require('@scrypted/sdk/storage-settings') as typeof import('@scrypted/sdk/storage-settings');
-const {
-    default: sdk,
-    LockState,
-    ScryptedDeviceBase,
-    ScryptedDeviceType,
-    ScryptedInterface,
-    ScryptedMimeTypes,
-} = require('@scrypted/sdk') as typeof import('@scrypted/sdk');
-
-const { deviceManager, mediaManager } = sdk;
 const LEGACY_GATE_LOCK_NATIVE_ID = 'ds06m-gate-lock';
 const DOORBELL_NAME = 'Домофон';
 const DOORBELL_ROOM = 'Улица';
-
-function decodeMuLawSample(value: number): number {
-    value = (~value) & 0xff;
-    const sign = value & 0x80;
-    const exponent = (value >> 4) & 0x07;
-    const mantissa = value & 0x0f;
-    let sample = ((mantissa << 3) + 0x84) << exponent;
-    sample -= 0x84;
-    return sign ? -sample : sample;
-}
-
-class Ds06mGateRelay {
-    private autoLockTimer?: NodeJS.Timeout;
-    private operation: Promise<void> = Promise.resolve();
-
-    constructor(private device: SipCamera) {
-        this.device.lockState = LockState.Locked;
-    }
-
-    getSettings(): Setting[] {
-        return [
-            {
-                key: 'openUrl',
-                title: 'Open Relay URL',
-                value: this.device.storage.getItem('openUrl'),
-                type: 'string',
-                description: 'HTTP(S) GET URL that activates the DS06M gate relay. Credentials remain in Scrypted storage.',
-            },
-            {
-                key: 'timeoutSeconds',
-                title: 'Request Timeout',
-                value: Number(this.device.storage.getItem('timeoutSeconds') || 5),
-                type: 'number',
-                description: 'HTTP request timeout in seconds.',
-            },
-            {
-                key: 'autoLock',
-                title: 'Auto Lock',
-                value: this.device.storage.getItem('autoLock') !== 'false',
-                type: 'boolean',
-                description: 'Return the HomeKit lock state to locked after opening.',
-            },
-            {
-                key: 'autoLockDelaySeconds',
-                title: 'Auto Lock Delay',
-                value: Number(this.device.storage.getItem('autoLockDelaySeconds') || 5),
-                type: 'number',
-                description: 'Seconds before the HomeKit lock state returns to locked.',
-            },
-        ];
-    }
-
-    async unlock(): Promise<void> {
-        clearTimeout(this.autoLockTimer);
-        await this.enqueue(async () => {
-            await this.requestRelay();
-            this.device.lockState = LockState.Unlocked;
-
-            if (this.device.storage.getItem('autoLock') !== 'false') {
-                const delaySeconds = this.readPositiveNumber('autoLockDelaySeconds', 5);
-                this.autoLockTimer = setTimeout(() => {
-                    void this.lock().catch(error => this.device.console.error('DS06M gate lock state update failed', error));
-                }, delaySeconds * 1000);
-            }
-        });
-    }
-
-    async lock(): Promise<void> {
-        clearTimeout(this.autoLockTimer);
-        await this.enqueue(async () => {
-            this.device.lockState = LockState.Locked;
-        });
-    }
-
-    private enqueue(action: () => Promise<void>): Promise<void> {
-        const result = this.operation.then(action, action);
-        this.operation = result.catch(() => undefined);
-        return result;
-    }
-
-    private readPositiveNumber(key: string, fallback: number): number {
-        const parsed = Number(this.device.storage.getItem(key));
-        return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-    }
-
-    private async requestRelay(): Promise<void> {
-        const value = this.device.storage.getItem('openUrl')?.trim();
-        if (!value)
-            throw new Error('Open Relay URL is not configured');
-
-        const target = new URL(value);
-        if (target.protocol !== 'http:' && target.protocol !== 'https:')
-            throw new Error('Relay URL must use HTTP or HTTPS');
-
-        const timeoutMs = this.readPositiveNumber('timeoutSeconds', 5) * 1000;
-        const transport = target.protocol === 'https:' ? https : http;
-        const username = decodeURIComponent(target.username);
-        const password = decodeURIComponent(target.password);
-        target.username = '';
-        target.password = '';
-
-        await new Promise<void>((resolve, reject) => {
-            const request = transport.request(target, {
-                method: 'GET',
-                auth: username ? `${username}:${password}` : undefined,
-            }, response => {
-                response.resume();
-                if (response.statusCode && response.statusCode >= 200 && response.statusCode < 300)
-                    resolve();
-                else
-                    reject(new Error(`DS06M relay returned HTTP ${response.statusCode || 'unknown'}`));
-            });
-            request.setTimeout(timeoutMs, () => request.destroy(new Error('DS06M relay request timed out')));
-            request.once('error', reject);
-            request.end();
-        });
-    }
-}
+const PLUGIN_VERSION = '0.4.5';
+const DOORBELL_INTERFACES = [
+    ScryptedInterface.Camera,
+    ScryptedInterface.VideoCamera,
+    ScryptedInterface.Settings,
+    ScryptedInterface.Intercom,
+    ScryptedInterface.BinarySensor,
+    ScryptedInterface.MotionSensor,
+    ScryptedInterface.Lock,
+];
 
 class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCamera, Settings, BinarySensor, MotionSensor, Lock {
     buttonTimeout: NodeJS.Timeout;
@@ -909,7 +790,7 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
 
 export class SipCamProvider extends ScryptedDeviceBase implements DeviceProvider, DeviceCreator, MixinProvider {
 
-    devices = new Map<string, any>();
+    devices = new Map<string, SipCamera>();
 
     constructor(nativeId?: string) {
         super(nativeId);
@@ -960,16 +841,6 @@ export class SipCamProvider extends ScryptedDeviceBase implements DeviceProvider
     }
 
     updateDevice(nativeId: string, name: string) {
-        const interfaces = [
-            ScryptedInterface.Camera,
-            ScryptedInterface.VideoCamera,
-            ScryptedInterface.Settings,
-            ScryptedInterface.Intercom,
-            ScryptedInterface.BinarySensor,
-            ScryptedInterface.MotionSensor,
-        ];
-        interfaces.push(ScryptedInterface.Lock);
-
         return deviceManager.onDeviceDiscovered({
             nativeId,
             name,
@@ -977,14 +848,14 @@ export class SipCamProvider extends ScryptedDeviceBase implements DeviceProvider
             info: {
                 manufacturer: 'BEWARD',
                 model: 'DS06M',
-                version: '0.4.4',
+                version: PLUGIN_VERSION,
             },
-            interfaces,
+            interfaces: [...DOORBELL_INTERFACES],
             type: ScryptedDeviceType.Doorbell,
         });
     }
 
-    getDevice(nativeId: string) {
+    async getDevice(nativeId: string): Promise<SipCamera> {
         let ret = this.devices.get(nativeId);
         if (!ret) {
             ret = this.createCamera(nativeId);
