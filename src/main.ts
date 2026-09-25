@@ -1,6 +1,5 @@
 import { closeQuiet, createBindZero, ffmpegLogInitialOutput, listenZero, safePrintFFmpegArguments } from './compat';
-import { StorageSettings } from '@scrypted/sdk/storage-settings';
-import sdk, { BinarySensor, Camera, DeviceProvider, DeviceCreator, DeviceCreatorSettings, EventListenerRegister, FFmpegInput, Intercom, Lock, LockState, MediaObject, MixinProvider, MotionSensor, PictureOptions, ResponseMediaStreamOptions, ScryptedDevice, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, SettingValue, VideoCamera, WritableDeviceState } from '@scrypted/sdk';
+import type { BinarySensor, Camera, DeviceProvider, DeviceCreator, DeviceCreatorSettings, EventListenerRegister, FFmpegInput, Intercom, Lock, MediaObject, MixinProvider, MotionSensor, PictureOptions, ResponseMediaStreamOptions, ScryptedDevice, ScryptedDeviceType as ScryptedDeviceTypeValue, ScryptedInterface as ScryptedInterfaceValue, Setting, Settings, SettingValue, VideoCamera, WritableDeviceState } from '@scrypted/sdk';
 import child_process, { ChildProcess } from 'child_process';
 import dgram from 'dgram';
 import http from 'http';
@@ -10,6 +9,19 @@ import { SipCallSession } from './sip-call-session';
 import { SipManager, SipOptions } from './sip-manager';
 import { RtpDescription, isStunMessage, getPayloadType, getSequenceNumber, isRtpMessagePayloadType } from './rtp-utils';
 import { randomBytes } from "crypto";
+
+// Load the SDK through CommonJS. Scrypted 0.147 runs plugins as CommonJS and
+// the published SDK's ESM interop path can otherwise initialize before the
+// server has exposed its static runtime object.
+const { StorageSettings } = require('@scrypted/sdk/storage-settings') as typeof import('@scrypted/sdk/storage-settings');
+const {
+    default: sdk,
+    LockState,
+    ScryptedDeviceBase,
+    ScryptedDeviceType,
+    ScryptedInterface,
+    ScryptedMimeTypes,
+} = require('@scrypted/sdk') as typeof import('@scrypted/sdk');
 
 const { deviceManager, mediaManager } = sdk;
 const LEGACY_GATE_LOCK_NATIVE_ID = 'ds06m-gate-lock';
@@ -158,7 +170,6 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
     constructor(nativeId: string, public provider: SipCamProvider) {
         super(nativeId);
         this.binaryState = false;
-        this.motionDetected = false;
         this.gateRelay = new Ds06mGateRelay(this);
         this.doorbellAudioActive = false;
         this.audioSilenceProcess = null;
@@ -167,7 +178,6 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
         // to be opened.
         void this.ensureIncomingSip().catch(error =>
             this.console.error('SIP: failed to start DS06M listener', error));
-        this.refreshSourceMotionSensor();
     }
 
     async unlock(): Promise<void> {
@@ -229,6 +239,9 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
     }
 
     async getSettings(): Promise<Setting[]> {
+        // Older Scrypted releases may retain the previous child descriptor
+        // after updating a local plugin. Refresh it when settings are opened.
+        await this.provider.updateDevice(this.nativeId, this.name || DOORBELL_NAME);
         return [
             ...(this.gateRelay?.getSettings() || []),
             {
@@ -866,7 +879,7 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
         }, 15000);
     }
 
-    private refreshSourceMotionSensor(): void {
+    refreshSourceMotionSensor(): void {
         this.sourceMotionListener?.removeListener();
         this.sourceMotionListener = undefined;
         this.sourceMotionDetected = false;
@@ -910,13 +923,18 @@ export class SipCamProvider extends ScryptedDeviceBase implements DeviceProvider
                 void deviceManager.onDeviceRemoved(camId);
                 continue;
             }
-            this.getDevice(camId);
             const state = deviceManager.getDeviceState(camId);
             const currentName = sdk.systemManager.getDeviceById(state.id)?.name;
             const name = !currentName || currentName === 'DS06M SIP Bridge'
                 ? DOORBELL_NAME
                 : currentName;
-            void this.updateDevice(camId, name);
+            // Register new interfaces before constructing the device. Setting a
+            // MotionSensor property before Scrypted knows that interface causes
+            // older installations to reject the device instance and retain the
+            // previous descriptor.
+            void this.updateDevice(camId, name)
+                .then(() => this.getDevice(camId))
+                .catch(error => this.console.error('Failed to refresh DS06M descriptor', error));
         }
     }
 
@@ -959,7 +977,7 @@ export class SipCamProvider extends ScryptedDeviceBase implements DeviceProvider
             info: {
                 manufacturer: 'BEWARD',
                 model: 'DS06M',
-                version: '0.4.0',
+                version: '0.4.4',
             },
             interfaces,
             type: ScryptedDeviceType.Doorbell,
@@ -970,8 +988,14 @@ export class SipCamProvider extends ScryptedDeviceBase implements DeviceProvider
         let ret = this.devices.get(nativeId);
         if (!ret) {
             ret = this.createCamera(nativeId);
-            if (ret)
+            if (ret) {
                 this.devices.set(nativeId, ret);
+                // Refresh the descriptor whenever Scrypted asks the provider
+                // to recreate a child after a plugin or server update.
+                void this.updateDevice(nativeId, DOORBELL_NAME)
+                    .then(() => ret.refreshSourceMotionSensor())
+                    .catch(error => this.console.error('Failed to initialize DS06M motion sensor', error));
+            }
         }
         return ret;
     }
@@ -996,7 +1020,7 @@ export class SipCamProvider extends ScryptedDeviceBase implements DeviceProvider
         return bridge;
     }
 
-    async canMixin(type: ScryptedDeviceType, interfaces: string[]): Promise<string[]> {
+    async canMixin(type: ScryptedDeviceTypeValue, interfaces: string[]): Promise<string[]> {
         if ((type !== ScryptedDeviceType.Camera && type !== ScryptedDeviceType.Doorbell)
             || !interfaces.includes(ScryptedInterface.VideoCamera)
             || interfaces.includes(ScryptedInterface.Intercom))
@@ -1004,7 +1028,7 @@ export class SipCamProvider extends ScryptedDeviceBase implements DeviceProvider
         return [ScryptedInterface.Intercom];
     }
 
-    async getMixin(mixinDevice: any, mixinDeviceInterfaces: ScryptedInterface[], mixinDeviceState: WritableDeviceState): Promise<any> {
+    async getMixin(mixinDevice: any, mixinDeviceInterfaces: ScryptedInterfaceValue[], mixinDeviceState: WritableDeviceState): Promise<any> {
         return new Ds06mIntercomMixin(this);
     }
 
