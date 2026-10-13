@@ -16,7 +16,7 @@ import { deviceManager, mediaManager, sdk, ScryptedDeviceBase, ScryptedDeviceTyp
 const LEGACY_GATE_LOCK_NATIVE_ID = 'ds06m-gate-lock';
 const DOORBELL_NAME = 'Домофон';
 const DOORBELL_ROOM = 'Улица';
-const PLUGIN_VERSION = '0.4.6';
+const PLUGIN_VERSION = '0.4.7';
 const DOORBELL_INTERFACES = [
     ScryptedInterface.Camera,
     ScryptedInterface.VideoCamera,
@@ -45,6 +45,9 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
     acceptingIncomingCall: Promise<void>;
     private gateRelay: Ds06mGateRelay;
     private sourceMotionListener?: EventListenerRegister;
+    private directMotionRequest?: http.ClientRequest;
+    private directMotionRetry?: NodeJS.Timeout;
+    private directMotionBuffer = '';
     private sourceMotionDetected = false;
     private doorbellMotionDetected = false;
 
@@ -59,6 +62,7 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
         // to be opened.
         void this.ensureIncomingSip().catch(error =>
             this.console.error('SIP: failed to start DS06M listener', error));
+        this.refreshMotionSensor();
     }
 
     async unlock(): Promise<void> {
@@ -116,8 +120,8 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
             this.storage.setItem(key, value.toString());
         }
 
-        if (key === 'sourceCameraId')
-            this.refreshSourceMotionSensor();
+        if (['sourceCameraId', 'username', 'password', 'openUrl', 'ffmpegInputs', 'motionDetection'].includes(key))
+            this.refreshMotionSensor();
 
         this.onDeviceEvent(ScryptedInterface.Settings, undefined);
     }
@@ -134,6 +138,13 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
                 value: this.storage.getItem('sourceCameraId'),
                 description: 'Optional Scrypted camera ID. Leave empty to use the RTSP Stream URL directly; SIP is used only for talkback.',
                 placeholder: 'device-id',
+            },
+            {
+                key: 'motionDetection',
+                title: 'Built-in Motion Detection',
+                value: this.storage.getItem('motionDetection') !== 'false',
+                type: 'boolean',
+                description: 'Listen directly to the DS06M MotionDetection event stream. No external Scrypted camera or sensor is required.',
             },
             {
                 key: 'username',
@@ -697,6 +708,12 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
                 ...options,
                 id: selected.id,
                 container: 'rtsp',
+                // Requested codecs describe the consumer preference, while
+                // these fields must describe what the DS06M actually sends.
+                // HomeKit uses them to decide whether G.711U needs AAC
+                // transcoding for Secure Video recordings.
+                video: selected.video,
+                audio: selected.audio,
             },
         };
         return this.createMediaObject(stream, ScryptedMimeTypes.MediaStreamUrl);
@@ -812,27 +829,131 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
         }, 15000);
     }
 
-    refreshSourceMotionSensor(): void {
+    refreshMotionSensor(): void {
         this.sourceMotionListener?.removeListener();
         this.sourceMotionListener = undefined;
+        this.directMotionRequest?.destroy();
+        this.directMotionRequest = undefined;
+        clearTimeout(this.directMotionRetry);
+        this.directMotionRetry = undefined;
+        this.directMotionBuffer = '';
         this.sourceMotionDetected = false;
 
+        // Preserve source-camera motion forwarding for existing setups. When
+        // no source is selected, subscribe directly to the DS06M event stream.
         const sourceCameraId = this.storage.getItem('sourceCameraId');
         const source = sourceCameraId && sdk.systemManager.getDeviceById(sourceCameraId) as ScryptedDevice & MotionSensor;
-        if (!source?.interfaces?.includes(ScryptedInterface.MotionSensor)) {
+        if (source?.interfaces?.includes(ScryptedInterface.MotionSensor)) {
+            this.sourceMotionDetected = !!source.motionDetected;
             this.updateMotionState();
+            this.sourceMotionListener = sdk.systemManager.listenDevice(
+                sourceCameraId,
+                { event: ScryptedInterface.MotionSensor, watch: true },
+                eventSource => {
+                    this.sourceMotionDetected = !!(eventSource as ScryptedDevice & MotionSensor)?.motionDetected;
+                    this.updateMotionState();
+                });
             return;
         }
 
-        this.sourceMotionDetected = !!source.motionDetected;
         this.updateMotionState();
-        this.sourceMotionListener = sdk.systemManager.listenDevice(
-            sourceCameraId,
-            { event: ScryptedInterface.MotionSensor, watch: true },
-            eventSource => {
-                this.sourceMotionDetected = !!(eventSource as ScryptedDevice & MotionSensor)?.motionDetected;
-                this.updateMotionState();
+        if (this.storage.getItem('motionDetection') !== 'false')
+            this.startDirectMotionListener();
+    }
+
+    private getDirectMotionTarget(): { target: URL; auth?: string } | undefined {
+        let target: URL;
+        let relayUsername = '';
+        let relayPassword = '';
+
+        try {
+            const relayUrl = this.storage.getItem('openUrl')?.trim();
+            if (relayUrl) {
+                const relayTarget = new URL(relayUrl);
+                relayUsername = decodeURIComponent(relayTarget.username);
+                relayPassword = decodeURIComponent(relayTarget.password);
+                target = new URL(`${relayTarget.protocol}//${relayTarget.host}/cgi-bin/alarmchangestate_cgi`);
+            }
+            else {
+                const ffmpegInputs = this.storageSettings.values.ffmpegInputs as string[];
+                const streamTarget = new URL(ffmpegInputs?.[0]);
+                target = new URL(`http://${streamTarget.hostname}/cgi-bin/alarmchangestate_cgi`);
+            }
+        }
+        catch {
+            return undefined;
+        }
+
+        target.searchParams.set('channel', '0');
+        target.searchParams.set('parameter', 'MotionDetection');
+        const username = this.storage.getItem('username')?.trim() || relayUsername;
+        const password = this.storage.getItem('password') || relayPassword;
+        return {
+            target,
+            auth: username ? `${username}:${password}` : undefined,
+        };
+    }
+
+    private startDirectMotionListener(): void {
+        const connection = this.getDirectMotionTarget();
+        if (!connection) {
+            this.console.warn('Motion: configure the RTSP Stream URL or Open Relay URL to locate the DS06M');
+            return;
+        }
+
+        const retry = () => {
+            if (this.storage.getItem('motionDetection') === 'false')
+                return;
+            clearTimeout(this.directMotionRetry);
+            this.directMotionRetry = setTimeout(() => this.startDirectMotionListener(), 5000);
+        };
+        const transport = connection.target.protocol === 'https:' ? https : http;
+        const request = transport.request(connection.target, {
+            method: 'GET',
+            auth: connection.auth,
+            headers: { Accept: 'text/plain' },
+        }, response => {
+            // The DS06M keeps this HTTP response open and may stay silent until
+            // motion changes. The request timeout is only for establishing the
+            // connection; leaving it enabled would tear down a healthy stream.
+            request.setTimeout(0);
+            if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
+                response.resume();
+                this.console.warn(`Motion: DS06M event stream returned HTTP ${response.statusCode || 'unknown'}`);
+                retry();
+                return;
+            }
+
+            this.console.log('Motion: connected to the built-in DS06M MotionDetection event stream');
+            response.setEncoding('utf8');
+            response.on('data', chunk => {
+                this.directMotionBuffer += chunk;
+                const lines = this.directMotionBuffer.split(/\r?\n/);
+                this.directMotionBuffer = lines.pop() || '';
+                for (const line of lines)
+                    this.handleDirectMotionLine(line);
             });
+            response.once('end', retry);
+            response.once('error', error => {
+                this.console.warn('Motion: DS06M event stream error', error);
+                retry();
+            });
+        });
+        this.directMotionRequest = request;
+        request.setTimeout(15000, () => request.destroy(new Error('DS06M motion event stream timed out')));
+        request.once('error', error => {
+            this.console.warn('Motion: failed to connect to the DS06M event stream', error);
+            retry();
+        });
+        request.end();
+    }
+
+    private handleDirectMotionLine(line: string): void {
+        const fields = line.trim().split(';');
+        if (fields.length < 4 || fields[2] !== 'MotionDetection')
+            return;
+        this.sourceMotionDetected = fields[3] !== '0';
+        this.updateMotionState();
     }
 
     private updateMotionState(): void {
@@ -916,7 +1037,7 @@ export class SipCamProvider extends ScryptedDeviceBase implements DeviceProvider
                 // Refresh the descriptor whenever Scrypted asks the provider
                 // to recreate a child after a plugin or server update.
                 void this.updateDevice(nativeId, DOORBELL_NAME)
-                    .then(() => ret.refreshSourceMotionSensor())
+                    .then(() => ret.refreshMotionSensor())
                     .catch(error => this.console.error('Failed to initialize DS06M motion sensor', error));
             }
         }

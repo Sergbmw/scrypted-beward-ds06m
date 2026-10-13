@@ -12,7 +12,8 @@ It exposes the DS06M as a `Doorbell`. Video and incoming audio can come directly
 
 - RTSP video and incoming audio;
 - incoming SIP calls;
-- HomeKit Secure Video motion events from the source camera, with a doorbell press used as a fallback recording trigger;
+- built-in DS06M motion events over its HTTP event stream, with no separate Scrypted camera or sensor;
+- HomeKit Secure Video motion events, with a doorbell press used as a fallback recording trigger;
 - HomeKit → Scrypted → DS06M talkback using PCMU/G.711U at 8 kHz;
 - delayed SIP answer until speech is detected, so merely opening the camera does not stop the doorbell from ringing;
 - HTTP gate relay control;
@@ -44,6 +45,7 @@ The Scrypted CLI will request the server address and credentials. Never store a 
 | Setting | Example | Purpose |
 | --- | --- | --- |
 | `Source Camera ID` | Scrypted camera ID | Optional external source for video, audio, snapshots, and motion events; leave empty for direct RTSP |
+| `Built-in Motion Detection` | enabled | Receive `MotionDetection` events directly from the DS06M over HTTP |
 | `RTSP Stream URL` | `rtsp://<DOORBELL_HOST>:554/av0_0` | Direct DS06M stream used when `Source Camera ID` is empty |
 | `SIP From: URI` | `scrypted@<SCRYPTED_HOST>:5060` | Local SIP listener address |
 | `SIP To: URI` | `doorbell@<DOORBELL_HOST>:5060` | Door station SIP address |
@@ -52,7 +54,7 @@ The Scrypted CLI will request the server address and credentials. Never store a 
 
 The relay URL is stored in Scrypted device storage. Do not include a real URL or credentials in source files, issues, or build logs.
 
-For a single `Doorbell` device, configure `RTSP Stream URL` and leave `Source Camera ID` empty. Keep a separate ONVIF/RTSP camera only for features unavailable from the direct stream, such as continuous ONVIF motion detection.
+For a single `Doorbell` device, configure `RTSP Stream URL`, enable `Built-in Motion Detection`, and leave `Source Camera ID` empty. The plugin receives motion directly from the DS06M, so a separate ONVIF/RTSP camera is not required. Motion detection and a detection area must be enabled in the panel web interface.
 
 ## DS06M SIP configuration
 
@@ -74,7 +76,7 @@ HomeKit may start sending talkback audio as soon as live view opens. The plugin 
 
 ## HomeKit Secure Video
 
-The doorbell exposes the `MotionSensor` interface required by HomeKit Secure Video. Motion from the selected source camera is forwarded to HomeKit. A DS06M button press also creates a 15-second motion event so HomeKit can record the call without a separate detector.
+The doorbell exposes the `MotionSensor` interface required by HomeKit Secure Video. The plugin subscribes to the DS06M built-in HTTP `MotionDetection` event stream and forwards its state to HomeKit. If `Source Camera ID` points to a device with motion detection, its state is still used for backwards compatibility. A DS06M button press also creates a 15-second motion event so HomeKit can record the call.
 
 Use a standalone HomeKit accessory for an HKSV camera:
 
